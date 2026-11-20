@@ -24,11 +24,8 @@ jobs:
           xcodebuild -showsdks | grep -i ios
 
       - name: Build llama.cpp xcframework
-        run: |
-          cd llama.cpp
-          chmod +x build-xcframework.sh
-          ./build-xcframework.sh
-          ls -la build-apple/llama.xcframework/
+        working-directory: llama.cpp
+        run: bash build-xcframework.sh ios-device
 
       - name: Build iOS app
         run: |

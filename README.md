@@ -4,7 +4,7 @@ Run custom GGUF language models locally on iPad and iPhone. Serve them through a
 
 ## Features
 
-- **Local inference** — runs GGUF models on-device with Metal GPU acceleration via llama.cpp
+- **Local inference** — runs GGUF models, including Gemma 4, on-device with Metal GPU acceleration via llama.cpp
 - **OpenAI-compatible API** — serves `/v1/chat/completions` so any client that speaks OpenAI can talk to your iPad
 - **HuggingFace downloads** — browse and download models directly in the app
 - **Server mode** — toggle the HTTP server on/off, see your IP and port in the UI
@@ -45,11 +45,12 @@ The app builds on GitHub Actions using a macOS runner with Xcode:
 3. Download the IPA artifact from the Actions run
 4. Sideload to your device via AltStore
 
-The workflow builds the llama.cpp xcframework from source, then compiles the iOS app. No local macOS machine needed.
+The workflow builds the llama.cpp XCFramework from the pinned [v1.0.0](https://github.com/ggml-org/llama.cpp/releases/tag/v1.0.0) submodule, then compiles the iOS app. No local macOS machine needed.
 
 ## Known Limitations
 
 - **Memory pressure** — iPads with 8GB RAM can crash on long prompts with large models. Use Q4_K_M quantization and keep context sizes reasonable.
+- **Gemma 4** — text-only inference. Try E2B first on an 8 GB iPad if E4B does not fit in memory.
 - **Foreground only** — iOS suspends background apps. The server only works while the app is in the foreground with the screen on.
 - **Single request** — inference is single-threaded. Concurrent API requests queue behind the active one.
 
@@ -58,7 +59,7 @@ The workflow builds the llama.cpp xcframework from source, then compiles the iOS
 - Swift + SwiftUI frontend
 - llama.cpp via xcframework for inference (Metal-accelerated)
 - Network.framework HTTP server (no external dependencies)
-- ChatML prompt formatting with `/no_think` support for reasoning models
+- Gemma 4 turn formatting for Gemma 4; ChatML with `/no_think` for other models over the API
 
 ## Created By
 

@@ -1,4 +1,5 @@
 import Foundation
+import Combine
 
 struct Model: Identifiable {
     var id = UUID()
@@ -48,7 +49,7 @@ class LlamaState: ObservableObject {
         do {
             try loadModel(modelUrl: defaultModelUrl)
         } catch {
-            messageLog += "Error!\n"
+            print("Failed to load default model: \(error.localizedDescription)")
         }
 
         for model in defaultModels {
@@ -117,7 +118,14 @@ class LlamaState: ObservableObject {
     func loadModel(modelUrl: URL?) throws {
         if let modelUrl {
             messageLog += "Loading model...\n"
-            llamaContext = try LlamaContext.create_context(path: modelUrl.path())
+            // Drop the old model before allocating the new one on a memory-constrained device.
+            llamaContext = nil
+            do {
+                llamaContext = try LlamaContext.create_context(path: modelUrl.path())
+            } catch {
+                messageLog += "Failed to load \(modelUrl.lastPathComponent): \(error.localizedDescription)\n"
+                throw error
+            }
             messageLog += "Loaded model \(modelUrl.lastPathComponent)\n"
 
             // Assuming that the model is successfully loaded, update the downloaded models
@@ -139,7 +147,15 @@ class LlamaState: ObservableObject {
         }
 
         let t_start = DispatchTime.now().uptimeNanoseconds
-        await llamaContext.completion_init(text: text)
+        let prompt = llamaContext.usesGemma4Prompt
+            ? llamaContext.chatPrompt(messages: [ChatMessage(role: "user", content: text)])
+            : text
+        do {
+            try await llamaContext.completion_init(text: prompt)
+        } catch {
+            messageLog += "\(error.localizedDescription)\n"
+            return
+        }
         let t_heat_end = DispatchTime.now().uptimeNanoseconds
         let t_heat = Double(t_heat_end - t_start) / NS_PER_S
 
@@ -230,12 +246,17 @@ class LlamaState: ObservableObject {
     }
 
     // Non-streaming completion for API use
-    func completeForAPI(text: String, maxTokens: Int = 500) async -> String {
+    func completeForAPI(messages: [ChatMessage], maxTokens: Int = 500) async -> String {
         guard let llamaContext else {
             return "Error: No model loaded"
         }
 
-        await llamaContext.completion_init(text: text)
+        let prompt = llamaContext.chatPrompt(messages: messages)
+        do {
+            try await llamaContext.completion_init(text: prompt)
+        } catch {
+            return "Error: \(error.localizedDescription)"
+        }
         var result = ""
         var tokenCount = 0
 

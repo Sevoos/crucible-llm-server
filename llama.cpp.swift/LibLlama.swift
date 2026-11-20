@@ -1,8 +1,27 @@
 import Foundation
 import llama
 
-enum LlamaError: Error {
+enum LlamaError: LocalizedError {
+    case couldNotLoadModel
     case couldNotInitializeContext
+    case invalidPrompt
+    case promptTooLong(Int)
+    case couldNotDecodePrompt
+
+    var errorDescription: String? {
+        switch self {
+        case .couldNotLoadModel: return "llama.cpp could not open the GGUF. Check device logs for details."
+        case .couldNotInitializeContext: return "Could not allocate the inference context. Try a smaller model."
+        case .invalidPrompt: return "The model could not tokenize the prompt."
+        case .promptTooLong(let limit): return "The prompt must be shorter than \(limit) tokens."
+        case .couldNotDecodePrompt: return "The model could not process the prompt."
+        }
+    }
+}
+
+struct ChatMessage {
+    let role: String
+    let content: String
 }
 
 func llama_batch_clear(_ batch: inout llama_batch) {
@@ -22,12 +41,15 @@ func llama_batch_add(_ batch: inout llama_batch, _ id: llama_token, _ pos: llama
 }
 
 actor LlamaContext {
+    private static let backendInitialized: Void = llama_backend_init()
+    private static let batchCapacity = 512
+
+    nonisolated let usesGemma4Prompt: Bool
     private var model: OpaquePointer
     private var context: OpaquePointer
     private var vocab: OpaquePointer
     private var sampling: UnsafeMutablePointer<llama_sampler>
     private var batch: llama_batch
-    private var tokens_list: [llama_token]
     var is_done: Bool = false
 
     /// This variable is used to store temporarily invalid cchars
@@ -41,26 +63,30 @@ actor LlamaContext {
     init(model: OpaquePointer, context: OpaquePointer) {
         self.model = model
         self.context = context
-        self.tokens_list = []
-        self.batch = llama_batch_init(512, 0, 1)
+        self.batch = llama_batch_init(Int32(Self.batchCapacity), 0, 1)
         self.temporary_invalid_cchars = []
         let sparams = llama_sampler_chain_default_params()
         self.sampling = llama_sampler_chain_init(sparams)
+        vocab = llama_model_get_vocab(model)
+
+        let architectureCapacity = 32
+        var architecture = [CChar](repeating: 0, count: architectureCapacity)
+        let length = llama_model_meta_val_str(model, "general.architecture", &architecture, architectureCapacity)
+        usesGemma4Prompt = length > 0 && String(cString: architecture) == "gemma4"
+
         llama_sampler_chain_add(self.sampling, llama_sampler_init_temp(0.4))
         llama_sampler_chain_add(self.sampling, llama_sampler_init_dist(1234))
-        vocab = llama_model_get_vocab(model)
     }
 
     deinit {
         llama_sampler_free(sampling)
         llama_batch_free(batch)
-        llama_model_free(model)
         llama_free(context)
-        llama_backend_free()
+        llama_model_free(model)
     }
 
     static func create_context(path: String) throws -> LlamaContext {
-        llama_backend_init()
+        _ = backendInitialized
         var model_params = llama_model_default_params()
 
 #if targetEnvironment(simulator)
@@ -70,7 +96,7 @@ actor LlamaContext {
         let model = llama_model_load_from_file(path, model_params)
         guard let model else {
             print("Could not load model at \(path)")
-            throw LlamaError.couldNotInitializeContext
+            throw LlamaError.couldNotLoadModel
         }
 
         let n_threads = max(1, min(8, ProcessInfo.processInfo.processorCount - 2))
@@ -78,12 +104,14 @@ actor LlamaContext {
 
         var ctx_params = llama_context_default_params()
         ctx_params.n_ctx = 1024  // reduced from 2048 to lower KV cache memory on iPad
+        ctx_params.n_batch = UInt32(batchCapacity)
         ctx_params.n_threads       = Int32(n_threads)
         ctx_params.n_threads_batch = Int32(n_threads)
 
         let context = llama_init_from_model(model, ctx_params)
         guard let context else {
             print("Could not load context!")
+            llama_model_free(model)
             throw LlamaError.couldNotInitializeContext
         }
 
@@ -114,39 +142,49 @@ actor LlamaContext {
         return batch.n_tokens;
     }
 
-    func completion_init(text: String) {
-        print("attempting to complete \"\(text)\"")
+    nonisolated func chatPrompt(messages: [ChatMessage]) -> String {
+        if usesGemma4Prompt {
+            let turns = messages.map { message in
+                let role = message.role == "assistant" ? "model" : message.role == "developer" ? "system" : message.role
+                let content = message.content.trimmingCharacters(in: .whitespacesAndNewlines)
+                return "<|turn>\(role)\n\(content)<turn|>\n"
+            }
+            return turns.joined() + "<|turn>model\n"
+        }
 
-        is_done = false
-        tokens_list = tokenize(text: text, add_bos: true)
+        var prompt = ""
+        if !messages.contains(where: { $0.role == "system" }) {
+            prompt = "<|im_start|>system\n/no_think\nBe concise and helpful.<|im_end|>\n"
+        }
+        for message in messages {
+            prompt += "<|im_start|>\(message.role)\n\(message.content)<|im_end|>\n"
+        }
+        return prompt + "<|im_start|>assistant\n"
+    }
+
+    func completion_init(text: String) throws {
+        let tokens = tokenize(text: text, add_bos: true)
+        guard !tokens.isEmpty else { throw LlamaError.invalidPrompt }
+
+        let contextLimit = min(Int(n_len), Int(llama_n_ctx(context)))
+        guard tokens.count < contextLimit else { throw LlamaError.promptTooLong(contextLimit) }
+
         temporary_invalid_cchars = []
 
-        let n_ctx = llama_n_ctx(context)
-        let n_kv_req = tokens_list.count + (Int(n_len) - tokens_list.count)
-
-        print("\n n_len = \(n_len), n_ctx = \(n_ctx), n_kv_req = \(n_kv_req)")
-
-        if n_kv_req > n_ctx {
-            print("error: n_kv_req > n_ctx, the required KV cache size is not big enough")
+        let batchSize = min(Self.batchCapacity, Int(llama_n_batch(context)))
+        for start in stride(from: 0, to: tokens.count, by: batchSize) {
+            llama_batch_clear(&batch)
+            for i in start..<min(start + batchSize, tokens.count) {
+                llama_batch_add(&batch, tokens[i], Int32(i), [0], i == tokens.count - 1)
+            }
+            guard llama_decode(context, batch) == 0 else {
+                clear()
+                throw LlamaError.couldNotDecodePrompt
+            }
         }
 
-        for id in tokens_list {
-            print(String(cString: token_to_piece(token: id) + [0]))
-        }
-
-        llama_batch_clear(&batch)
-
-        for i1 in 0..<tokens_list.count {
-            let i = Int(i1)
-            llama_batch_add(&batch, tokens_list[i], Int32(i), [0], false)
-        }
-        batch.logits[Int(batch.n_tokens) - 1] = 1 // true
-
-        if llama_decode(context, batch) != 0 {
-            print("llama_decode() failed")
-        }
-
-        n_cur = batch.n_tokens
+        n_cur = Int32(tokens.count)
+        is_done = false
     }
 
     func completion_loop() -> String {
@@ -154,7 +192,7 @@ actor LlamaContext {
 
         new_token_id = llama_sampler_sample(sampling, context, batch.n_tokens - 1)
 
-        if llama_vocab_is_eog(vocab, new_token_id) || n_cur == n_len {
+        if llama_vocab_is_eog(vocab, new_token_id) || n_cur >= n_len || Int(n_cur) >= Int(llama_n_ctx(context)) {
             print("\n")
             is_done = true
             let new_token_str = String(cString: temporary_invalid_cchars + [0])
@@ -187,6 +225,7 @@ actor LlamaContext {
 
         if llama_decode(context, batch) != 0 {
             print("failed to evaluate llama!")
+            is_done = true
         }
 
         return new_token_str
@@ -291,7 +330,6 @@ actor LlamaContext {
     }
 
     func clear() {
-        tokens_list.removeAll()
         temporary_invalid_cchars.removeAll()
         llama_memory_clear(llama_get_memory(context), true)
     }
@@ -300,16 +338,11 @@ actor LlamaContext {
         let utf8Count = text.utf8.count
         let n_tokens = utf8Count + (add_bos ? 1 : 0) + 1
         let tokens = UnsafeMutablePointer<llama_token>.allocate(capacity: n_tokens)
-        let tokenCount = llama_tokenize(vocab, text, Int32(utf8Count), tokens, Int32(n_tokens), add_bos, false)
+        defer { tokens.deallocate() }
+        let tokenCount = llama_tokenize(vocab, text, Int32(utf8Count), tokens, Int32(n_tokens), add_bos, usesGemma4Prompt)
 
-        var swiftTokens: [llama_token] = []
-        for i in 0..<tokenCount {
-            swiftTokens.append(tokens[Int(i)])
-        }
-
-        tokens.deallocate()
-
-        return swiftTokens
+        guard tokenCount > 0 else { return [] }
+        return Array(UnsafeBufferPointer(start: tokens, count: Int(tokenCount)))
     }
 
     /// - note: The result does not contain null-terminator
