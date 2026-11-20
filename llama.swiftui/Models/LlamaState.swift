@@ -245,31 +245,16 @@ class LlamaState: ObservableObject {
         }
     }
 
-    // Non-streaming completion for API use
-    func completeForAPI(messages: [ChatMessage], maxTokens: Int = 500) async -> String {
+    func completeForAPI(messages: [ChatMessage], maxTokens: Int) async throws -> (text: String, finishReason: String) {
         guard let llamaContext else {
-            return "Error: No model loaded"
+            throw LlamaError.noModelLoaded
         }
 
         let prompt = llamaContext.chatPrompt(messages: messages)
-        do {
-            try await llamaContext.completion_init(text: prompt)
-        } catch {
-            return "Error: \(error.localizedDescription)"
-        }
-        var result = ""
-        var tokenCount = 0
-
-        while await !llamaContext.is_done && tokenCount < maxTokens {
-            let piece = await llamaContext.completion_loop()
-            result += piece
-            tokenCount += 1
-        }
-
-        await llamaContext.clear()
+        let result = try await llamaContext.completeText(prompt: prompt, maxTokens: maxTokens)
 
         // Strip <think>...</think> blocks from Qwen-style reasoning models
-        var cleaned = result
+        var cleaned = result.text
         if let thinkStart = cleaned.range(of: "<think>") {
             if let thinkEnd = cleaned.range(of: "</think>") {
                 // Full think block — take everything after it
@@ -285,6 +270,6 @@ class LlamaState: ObservableObject {
             cleaned = String(cleaned[..<endTag.lowerBound])
         }
 
-        return cleaned.trimmingCharacters(in: .whitespacesAndNewlines)
+        return (cleaned.trimmingCharacters(in: .whitespacesAndNewlines), result.finishReason)
     }
 }

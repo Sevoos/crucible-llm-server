@@ -2,6 +2,7 @@ import Foundation
 import llama
 
 enum LlamaError: LocalizedError {
+    case noModelLoaded
     case couldNotLoadModel
     case couldNotInitializeContext
     case invalidPrompt
@@ -10,6 +11,7 @@ enum LlamaError: LocalizedError {
 
     var errorDescription: String? {
         switch self {
+        case .noModelLoaded: return "No model loaded."
         case .couldNotLoadModel: return "llama.cpp could not open the GGUF. Check device logs for details."
         case .couldNotInitializeContext: return "Could not allocate the inference context. Try a smaller model."
         case .invalidPrompt: return "The model could not tokenize the prompt."
@@ -229,6 +231,19 @@ actor LlamaContext {
         }
 
         return new_token_str
+    }
+
+    func completeText(prompt: String, maxTokens: Int) throws -> (text: String, finishReason: String) {
+        try completion_init(text: prompt)
+        defer { clear() }
+
+        var text = ""
+        for _ in 0..<maxTokens {
+            guard !is_done else { break }
+            text += completion_loop()
+        }
+        let hitLimit = !is_done || n_cur >= n_len || Int(n_cur) >= Int(llama_n_ctx(context))
+        return (text, hitLimit ? "length" : "stop")
     }
 
     func bench(pp: Int, tg: Int, pl: Int, nr: Int = 1) -> String {

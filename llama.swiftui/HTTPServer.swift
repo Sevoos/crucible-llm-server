@@ -57,34 +57,32 @@ class HTTPServer {
 
     private func handleConnection(_ connection: NWConnection) {
         connection.start(queue: .global(qos: .userInitiated))
-        connection.receive(minimumIncompleteLength: 1, maximumLength: 65536) { [weak self] data, _, _, error in
-            guard let self = self, let data = data, error == nil else {
+        receiveRequest(connection, reader: HTTPRequestReader())
+    }
+
+    private func receiveRequest(_ connection: NWConnection, reader: HTTPRequestReader) {
+        connection.receive(minimumIncompleteLength: 1, maximumLength: 65536) { [weak self] data, _, isComplete, error in
+            guard let self, error == nil else {
                 connection.cancel()
                 return
             }
-            let request = String(data: data, encoding: .utf8) ?? ""
-            self.routeRequest(request, connection: connection)
+            do {
+                if let request = try reader.append(data ?? Data(), isComplete: isComplete) {
+                    self.routeRequest(request, connection: connection)
+                } else {
+                    self.receiveRequest(connection, reader: reader)
+                }
+            } catch let failure as HTTPFailure {
+                self.sendError(connection, status: failure.status, message: failure.message)
+            } catch {
+                self.sendError(connection, status: "400 Bad Request", message: "Could not read HTTP request.")
+            }
         }
     }
 
-    private func routeRequest(_ request: String, connection: NWConnection) {
-        let lines = request.components(separatedBy: "\r\n")
-        guard let requestLine = lines.first else {
-            sendResponse(connection: connection, status: "400 Bad Request", body: "{\"error\":\"Bad Request\"}")
-            return
-        }
-
-        let parts = requestLine.components(separatedBy: " ")
-        guard parts.count >= 2 else {
-            sendResponse(connection: connection, status: "400 Bad Request", body: "{\"error\":\"Bad Request\"}")
-            return
-        }
-
-        let method = parts[0]
-        let path = parts[1]
-
+    private func routeRequest(_ request: HTTPRequest, connection: NWConnection) {
         // CORS headers for all responses
-        if method == "OPTIONS" {
+        if request.method == "OPTIONS" {
             sendResponse(connection: connection, status: "200 OK", body: "", extraHeaders: [
                 "Access-Control-Allow-Origin: *",
                 "Access-Control-Allow-Methods: GET, POST, OPTIONS",
@@ -93,19 +91,19 @@ class HTTPServer {
             return
         }
 
-        switch path {
+        switch request.path {
         case "/":
             sendResponse(connection: connection, status: "200 OK", body: "Crucible LLM Server is running")
         case "/v1/models", "/api/tags":
             handleModels(connection: connection)
         case "/v1/chat/completions":
-            if method == "POST" {
-                handleChatCompletion(request: request, connection: connection)
+            if request.method == "POST" {
+                handleChatCompletion(body: request.body, connection: connection)
             } else {
-                sendResponse(connection: connection, status: "405 Method Not Allowed", body: "{\"error\":\"Method Not Allowed\"}")
+                sendError(connection, status: "405 Method Not Allowed", message: "Use POST for chat completions.")
             }
         default:
-            sendResponse(connection: connection, status: "404 Not Found", body: "{\"error\":\"Not Found\"}")
+            sendError(connection, status: "404 Not Found", message: "Endpoint not found.")
         }
     }
 
@@ -116,60 +114,47 @@ class HTTPServer {
         sendResponse(connection: connection, status: "200 OK", body: response, contentType: "application/json")
     }
 
-    private func handleChatCompletion(request: String, connection: NWConnection) {
-        // Extract JSON body from HTTP request
-        guard let bodyStart = request.range(of: "\r\n\r\n")?.upperBound else {
-            sendResponse(connection: connection, status: "400 Bad Request", body: "{\"error\":\"No body\"}", contentType: "application/json")
+    private func handleChatCompletion(body: Data, connection: NWConnection) {
+        let request: ChatCompletionRequest
+        do {
+            request = try JSONDecoder().decode(ChatCompletionRequest.self, from: body)
+        } catch let failure as HTTPFailure {
+            sendError(connection, status: failure.status, message: failure.message)
+            return
+        } catch {
+            sendError(connection, status: "400 Bad Request", message: "Expected a JSON chat request with a messages array.")
             return
         }
 
-        let bodyString = String(request[bodyStart...])
-        guard let bodyData = bodyString.data(using: .utf8),
-              let json = try? JSONSerialization.jsonObject(with: bodyData) as? [String: Any],
-              let messages = json["messages"] as? [[String: Any]] else {
-            sendResponse(connection: connection, status: "400 Bad Request", body: "{\"error\":\"Invalid JSON\"}", contentType: "application/json")
-            return
-        }
-
-        let chatMessages = messages.map {
-            ChatMessage(role: $0["role"] as? String ?? "user", content: $0["content"] as? String ?? "")
-        }
-
-        let maxTokens = json["max_tokens"] as? Int ?? 500
-
-        // Run inference on a background thread
         Task {
-            guard let llamaState = await self.llamaState else {
-                self.sendResponse(connection: connection, status: "500 Internal Server Error",
-                                  body: "{\"error\":\"No model loaded\"}", contentType: "application/json")
+            guard let llamaState = self.llamaState else {
+                self.sendError(connection, status: "503 Service Unavailable", message: "No model loaded.")
                 return
             }
 
-            let result = await llamaState.completeForAPI(messages: chatMessages, maxTokens: maxTokens)
-
-            let responseJSON: [String: Any] = [
-                "id": "chatcmpl-\(UUID().uuidString.prefix(8))",
-                "object": "chat.completion",
-                "created": Int(Date().timeIntervalSince1970),
-                "model": "local",
-                "choices": [[
-                    "index": 0,
-                    "message": [
-                        "role": "assistant",
-                        "content": result
-                    ],
-                    "finish_reason": "stop"
-                ]]
-            ]
-
-            if let jsonData = try? JSONSerialization.data(withJSONObject: responseJSON),
-               let jsonString = String(data: jsonData, encoding: .utf8) {
-                self.sendResponse(connection: connection, status: "200 OK", body: jsonString, contentType: "application/json")
-            } else {
-                self.sendResponse(connection: connection, status: "500 Internal Server Error",
-                                  body: "{\"error\":\"Failed to serialize response\"}", contentType: "application/json")
+            let messages = request.messages.map { ChatMessage(role: $0.role, content: $0.content) }
+            do {
+                let result = try await llamaState.completeForAPI(messages: messages, maxTokens: request.maxTokens)
+                let response = try ChatCompletionResponse(text: result.text, finishReason: result.finishReason).encode(stream: request.stream)
+                self.sendResponse(connection: connection, status: "200 OK", body: response.body, contentType: response.contentType)
+            } catch let error as LlamaError {
+                let status: String
+                switch error {
+                case .noModelLoaded: status = "503 Service Unavailable"
+                case .invalidPrompt, .promptTooLong: status = "400 Bad Request"
+                default: status = "500 Internal Server Error"
+                }
+                self.sendError(connection, status: status, message: error.localizedDescription)
+            } catch {
+                self.sendError(connection, status: "500 Internal Server Error", message: "Failed to encode the chat response.")
             }
         }
+    }
+
+    private func sendError(_ connection: NWConnection, status: String, message: String) {
+        let type = status.hasPrefix("5") ? "server_error" : "invalid_request_error"
+        let body = (try? encodeJSON(["error": ["message": message, "type": type]])) ?? "{}"
+        sendResponse(connection: connection, status: status, body: body, contentType: "application/json")
     }
 
     private func sendResponse(connection: NWConnection, status: String, body: String,

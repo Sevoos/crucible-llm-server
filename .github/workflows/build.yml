@@ -23,6 +23,11 @@ jobs:
           sudo xcode-select -s "$XCODE_PATH"
           xcodebuild -showsdks | grep -i ios
 
+      - name: Test HTTP protocol
+        run: |
+          swiftc -swift-version 5 llama.swiftui/HTTPProtocol.swift tests/HTTPProtocolTests.swift -o "$RUNNER_TEMP/http-protocol-tests"
+          "$RUNNER_TEMP/http-protocol-tests"
+
       - name: Build llama.cpp xcframework
         working-directory: llama.cpp
         run: bash build-xcframework.sh ios-device

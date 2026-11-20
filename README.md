@@ -34,7 +34,36 @@ curl http://YOUR_IPAD_IP:8080/v1/chat/completions \
   }'
 ```
 
-Works with any OpenAI-compatible client — point it at `http://YOUR_IPAD_IP:8080` as the base URL.
+Point an OpenAI Chat Completions client at `http://YOUR_IPAD_IP:8080/v1`. The server accepts text messages only. When requested, it returns the completed reply as server-sent events; it does not stream individual tokens or report usage.
+
+### OpenCode
+
+Use an [OpenAI-compatible provider](https://opencode.ai/docs/providers#custom) with the model ID `local`. For example, merge this into your existing `opencode.jsonc` and select the model with `/models`:
+
+```jsonc
+{
+  "$schema": "https://opencode.ai/config.json",
+  "providers": {
+    "crucible": {
+      "name": "CrucibleLLM (iOS)",
+      "package": "@opencode/ai/providers/openai-compatible",
+      "settings": {
+        "baseURL": "http://YOUR_IPAD_IP:8080/v1",
+        "encoding": "none",
+      },
+      "compatibility": { "streamUsage": false },
+      "models": {
+        "local": {
+          "capabilities": { "tools": false, "input": ["text"], "output": ["text"] },
+          "limit": { "context": 1024, "output": 128 },
+        },
+      },
+    },
+  },
+}
+```
+
+The 1,024-token context includes the system prompt, history, and reply. OpenCode's default agent prompts may exceed it even in a fresh session. Use a short text prompt and note that coding agents that need tool calls are not supported.
 
 ## Building from Source
 
